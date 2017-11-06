@@ -1,0 +1,252 @@
+#!/usr/bin/python
+from __future__ import division
+from __future__ import print_function
+import argparse
+import os
+import sys
+from itertools import groupby, chain
+from pprint import pprint
+from subprocess import Popen, CalledProcessError, PIPE
+from operator import itemgetter
+from time import time
+from i3admin.ptab import Cell, CellBlock, ptab_disable_color
+import htcondor
+from htcondor import AdTypes, DaemonTypes
+import classad
+
+def _compact(scale, min_, max_=None, ndigits=0):
+    def func(val):
+        if val is None:
+            return ' '
+        if isinstance(val, str):
+            return val
+        val = val/scale
+        if ndigits > 0:
+            val = round(val, ndigits)
+        else:
+            val = int(round(val))
+        if min_ <= val <= (max_ if max_ is not None else min_):
+            return '.'
+        else:
+            if ndigits > 0:
+                ret = str(val).replace('0.', '.')
+                if ret == '.0':
+                    return '0'
+                else:
+                    return ret
+            else:
+                return str(val)
+    return func
+
+CondorJobStates = {0:'u', 1:'i', 2:'r', 3:'x', 4:'c', 5:'h', 6:'e'}
+
+JobRow = CellBlock(cells=[
+            ('owner', Cell('OWNER', 12, 'r', 
+                            descr='owner user name')),
+            ('jid', Cell('ID', 13, 'r', '*blk',
+                            descr='cluster and process id')),
+            ('stv', Cell('AGE', 5, 'r', 'wht',
+                            descr='time since submission')),
+            ('state', Cell('S', 1, 'r', 'ylw', adapter=lambda v:
+                                            CondorJobStates.get(v) or '?',
+                            descr='job state')),
+            ('restarts', Cell('TRY', 3, 'c', 'blk', _compact(1, 0, 0),
+                            descr='number of job starts')),
+            ('runt', Cell('RUNTM', 5, 'r', 'wht',
+                            descr='time since last (re)start')),
+            ('rdelay', Cell('DELAY', 5, 'r', '*blk',
+                            descr='time between submission and last (re)start')),
+            ('spacer1', Cell('', 0)),
+            ('rmem', Cell('RM', 2, 'r', 'cyn', _compact(1000, 1),
+                            descr='memory requested')),
+            ('umem', Cell('RS', 2, 'r', '*cyn', _compact(10**6, 1),
+                            descr='peak resident set size')),
+            ('uswp', Cell('SW', 2, 'r', 'cyn', _compact(10**6, 0),
+                            descr='approximate peak swap usage (unreliable)')),
+            ('rcpu', Cell('RC', 2, 'r', 'pur', _compact(1, 1),
+                            descr='CPU cores requested')),
+            ('uucpu', Cell('US', 2, 'r', '*pur', _compact(1, 1, 2),
+                            descr='average user CPU utilization')),
+            ('uscpu', Cell('SY', 2, 'r', 'red', _compact(1, 0, 0),
+                            descr='average system CPU utilization')),
+            ('rdsk', Cell('RD', 2, 'r', 'blu', _compact(10**6, 1),
+                            descr='disk requested')),
+            ('udsk', Cell('DS', 2, 'r', '*blu', _compact(10**6, 0),
+                            descr='peak disk usage (unreliable)')),
+            ('rgpu', Cell('RG', 2, 'r', 'blk', lambda x: 
+                                ' ' if x is None else ('.' if x==0 else str(x)),
+                            descr='GPUs requested')),
+            ('spacer2', Cell('', 0)),
+            ('host', Cell('HOST', 4, adapter=lambda v:
+                                # slot always reported as slot1
+                                v.split('@')[-1] if '@' in v else '?',
+                            descr='remote host')),
+        ],
+        descr='Job info',
+    )
+
+def elapsed(t):
+    dt = int(time() - t)
+    days = dt//60//60//24
+    hours = (dt - days * 24 * 60 *60) // 60 // 60
+    mins = (dt - days * 24 * 60 * 60 - hours * 60 * 60) // 60
+    if days:
+        return "%s+%02d" % (days, hours)
+    else:
+        return "%d:%02d" % (hours, mins)
+
+class CondorSchedd(object):
+    def __init__(self, names=[]):
+        if names:
+            ads = htcondor.Collector().locateAll(DaemonTypes.Schedd)
+            self.schedds = [htcondor.Schedd(a) for a in ads if a['Name'] in names]
+        else:
+            self.schedds = [htcondor.Schedd()]
+
+    def query(self, ftr, attrs=('ClusterId', 'ProcId')):
+        return chain.from_iterable(s.xquery(ftr, attrs) for s in self.schedds)
+
+def check_output(*args, **kwargs):
+    proc = Popen(stdout=PIPE, *args, **kwargs)
+    stdout, stderr = proc.communicate()
+    if proc.poll():
+        raise CalledProcessError(proc.returncode, kwargs.get('args') or args)
+    return stdout
+
+def get_jobs(ftr, attrs):
+    jobs = []
+    for j in Schedd.query(ftr, attrs):
+        j = dict(j)
+        try:
+            j['jid'] = '%s.%s' % (j['ClusterId'], j['ProcId'])
+        except KeyError:
+            j['jid'] = None
+        try:
+            # AccountingGroup could be an expr
+            j['group'] = str(j['AccountingGroup']).split('.')[0]
+        except KeyError:
+            j['group'] = '<none>'
+        exprs = [a for a in j if isinstance(j[a], classad.ExprTree)]
+        for a in exprs:
+            j[a] = j[a].eval()
+        jobs.append(j)
+    return jobs
+
+def get_swap(job):
+    return (job.get('ImageSize_RAW') or 0) - (job.get('ResidentSetSize_RAW') or 0)
+
+def get_load(job, attr):
+    if 'EnteredCurrentStatus' in job and attr in job:
+        now = time()
+        if now - job['EnteredCurrentStatus'] > 600:
+            return job[attr]/(now - job['EnteredCurrentStatus'])
+
+def get_peak(jobs, attr):
+    vals = [j.get(attr) for j in jobs]
+    try:
+        return max(filter(None, vals))
+    except ValueError:
+        return None
+
+def summarize(constraint):
+    attrs = ['ClusterId', 'ProcId', 'Owner', 'AccountingGroup', 'JobStatus', 
+                'RequestMemory', 'RequestDisk', 'RequestCpus', 'Requestgpus',
+                'QDate', 'EnteredCurrentStatus', 'NumJobStarts',
+                'ResidentSetSize_RAW', 'ImageSize_RAW', 'DiskUsage_RAW',
+                'RemoteUserCpu', 'RemoteSysCpu', 'RemoteHost',
+                ]
+    jobs = get_jobs(constraint, attrs)
+    jobs.sort(key=itemgetter('JobStatus', 'Owner', 'ClusterId', 'ProcId'))
+    for j in jobs:
+        JobRow.set('owner', j['Owner'])
+        JobRow.set('jid', j['jid'])
+        JobRow.set('state', j['JobStatus'])
+        JobRow.set('stv', elapsed(j['QDate']))
+        JobRow.set('restarts', j['NumJobStarts'] or 0),
+        JobRow.set('rcpu', j['RequestCpus']),
+        JobRow.set('rdsk', j['RequestDisk']),
+        JobRow.set('rmem', j['RequestMemory']),
+        JobRow.set('rgpu', j.get('Requestgpus') or 0),
+        if j['JobStatus'] == 2:
+            JobRow.set('runt', (elapsed(j['EnteredCurrentStatus']) 
+                                                if 'EnteredCurrentStatus' in j else '-:--'))
+            JobRow.set('rdelay', (elapsed(time() + j['QDate'] - j['EnteredCurrentStatus'])
+                                                if 'EnteredCurrentStatus' in j else '-:--'))
+            JobRow.set('uucpu', get_load(j, 'RemoteUserCpu') or 0)
+            JobRow.set('uscpu', get_load(j, 'RemoteSysCpu') or 0)
+            JobRow.set('umem', j.get('ResidentSetSize_RAW') or 0)
+            JobRow.set('udsk', j.get('DiskUsage_RAW') or 0)
+            JobRow.set('uswp', get_swap(j))
+            JobRow.set('host', j.get('RemoteHost') or '?'),
+        print(JobRow.render())
+
+def main():
+    epilog = "Note that the presented data is approximate and not real-time. " \
+                "Dots indicate default or \"expected\" values. Blank spaces " \
+                "indicate \"no information\"."
+    parser = argparse.ArgumentParser(
+            description="A user-friendly tool to display information about Condor jobs.",
+            epilog=epilog + " Report problems to help@icecube.wisc.edu.",
+            formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+    parser.add_argument(dest='filter', nargs='?', metavar='filter',
+            help='quick filter by owner, group, host, or job. '
+                 'Host names are regular expressions, so NAME-1\\\\. will '
+                 'match only machine NAME-1.domain and not NAME-10.domain.')
+    parser.add_argument('-s', dest='schedds', nargs='*', metavar='SCHEDD_FQDN',
+            help='names of schedds to query; all if None')
+    parser.add_argument('--help-legend', action='store_true',
+            help='print column descriptions and exit')
+    parser.add_argument('--no-color', default=False, action='store_true',
+            help='do not colorize output')
+    parser.add_argument('-c', dest='constraint', metavar='CONSTRAINT', default='TRUE',
+            help='raw condor constraint')
+    parser.add_argument('-i', '--idle', default=False, action='store_true',
+            help='show idle jobs')
+    parser.add_argument('-r', '--running', default=False, action='store_true',
+            help='show running jobs')
+    parser.add_argument('-H', '--held', default=False, action='store_true',
+            help='show held jobs')
+    parser.add_argument('-g', '--only-gpu', default=False, action='store_true',
+            help='show only gpu jobs')
+    parser.add_argument('-d', '--only-dags', default=False, action='store_true',
+            help='show only dag jobs')
+    opts = parser.parse_args()
+
+    if opts.no_color:
+        ptab_disable_color()
+    if opts.help_legend:
+        JobRow.legend()
+        return
+    disjuncts = []
+    if opts.idle:
+        disjuncts.append('JobStatus==1')
+    if opts.running:
+        disjuncts.append('JobStatus==2')
+    if opts.held:
+        disjuncts.append('JobStatus==5')
+    global Schedd
+    Schedd = CondorSchedd(opts.schedds)
+    print(JobRow.title())
+    conjuncts = ['(%s)' % opts.constraint]
+    if opts.only_dags:
+        conjuncts += ['(JobUniverse == 7)']
+    else:
+        conjuncts += ['(JobUniverse != 7)']
+    if opts.only_gpu:
+        conjuncts += ['(Requestgpus > 0)']
+    if disjuncts:
+        conjuncts += ['(%s)' % '||'.join(disjuncts)]
+    if opts.filter:
+        conjuncts += [ '(%s)' % ' || '.join([
+            'regexp("^%s", Machine)' % opts.filter,
+            'Owner=="%s"' % opts.filter,
+            'regexp("^%s\.", AccountingGroup)' % opts.filter,
+            # JobId match on cluster + process
+            'JobId=="%s"' % opts.filter,
+            # JobId match on cluster only
+            'regexp("^%s\.", string(JobId))' % opts.filter])]
+    summarize(' && '.join(conjuncts))
+    print(JobRow.title())
+    
+if __name__ == '__main__':
+    main()

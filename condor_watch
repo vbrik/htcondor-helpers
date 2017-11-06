@@ -1,0 +1,480 @@
+#!/usr/bin/env python
+from __future__ import division
+from __future__ import print_function
+import argparse
+import sys
+from collections import defaultdict
+from pprint import pprint
+from operator import itemgetter
+from time import time, strftime
+import classad
+import htcondor
+from htcondor import Schedd
+from i3admin.follow import follow
+from i3admin.term import ansi
+
+JobStatus = {
+    None: "N", #none (not official)
+    0: "U", #unexpanded
+    1: "I", #idle
+    2: 'R', #running
+    3: 'X', #removed
+    4: 'C', #complete
+    5: 'H', #held
+    6: 'T', #transferring
+    7: 'S', #suspended
+}
+
+class JournalState(object):
+    def __init__(self):
+        self.in_tx = False
+        self.incomplete = {}
+
+# Journal re-order buffer: buffer by job id and transaction marker
+# and re-order records so that JobStatus is emitted last (otherwise
+# we may miss some updates that follow JobStatus in a transaction)
+# Also, buffer "group" updates because they may set things like 
+# RequestMemory after actual job's JobStatus
+def journal_rob(jfile):
+    journal = follow(jfile, sleep=0.1)
+    line = journal.next()
+    jbuf = [get_quaple(line) + [line]]
+    for line in journal:
+        marker, jid, attr, val = get_quaple(line)
+        if marker == '107':
+            stderr('Journal rotation detected; waiting for duplicate record')
+            for line in journal:
+                marker, jid, attr, val = get_quaple(line)
+                if jbuf[-1] == [marker, jid, attr, val, line]:
+                    stderr('Dup: %s' % line)
+                    break
+            continue
+        prev_marker = jbuf[-1][0]
+        prev_jid = jbuf[-1][1]
+        if (prev_marker != marker or prev_jid != jid) and (not jid or jid[0] != '0'):
+            for y in [rec for rec in jbuf if rec[2] != 'JobStatus']:
+                yield y
+            for y in [rec for rec in jbuf if rec[2] == 'JobStatus']:
+                yield y
+            jbuf = []
+        jbuf.append([marker, jid, attr, val, line])
+
+# XXX .update() bypasses asserts to detect ClusterId and ProcId changes
+# attrs starting with capitals assumed to be classad attrs
+# return None for absent ad attrs
+class CondorJob(dict):
+    def __init__(self, rawjob, attrs=None):
+        self._key = set(('ClusterId', 'ProcId'))
+        assert self._key.issubset(rawjob.keys())
+        for k,v in rawjob.items():
+            if attrs is None or k in attrs:
+                self[k] = self._autocast(v)
+        self.__init_done = True
+
+    def __getattr__(self, name):
+        if name[0].isupper():
+            return self.get(name)
+        else:
+            return dict.__getattr__(self, name)
+
+    def __getitem__(self, name):
+        return (dict.__getitem__(self, name) if name in self else None)
+
+    def __setattr__(self, name, val):
+        # needed to allow setting attrs in __init__
+        if '_CondorJob__init_done' in self.__dict__:
+            dict.__setattr__(self, name, val)
+        elif name[0].isupper():
+            self.__setitem__(name, self._autocast(val))
+        else:
+            dict.__setattr__(self, name, val)
+
+    def __setitem__(self, name, val):
+        if name in self._key and '_CondorJob__init_done' in self.__dict__:
+            raise AttributeError("CondorJob.%s is immutable" % name)
+        dict.__setitem__(self, name, self._autocast(val))
+
+    # try to automatically convert Condor types to Python types
+    def _autocast(self, v):
+        if isinstance(v, type(classad.Value.Undefined)):
+            return None
+        if v.__class__ == classad.ExprTree:
+            return v.eval()
+        if v in (None, ''):
+            return None
+        try:
+            if v[0] == '"':
+                return v[1:-1]
+        except TypeError:
+            pass
+        try:
+            return int(v)
+        except ValueError:
+            pass
+        try:
+            return float(v)
+        except ValueError:
+            pass
+        if v.lower() in ('true', 'false'):
+            return v.lower() == 'true'
+        return v
+
+    @property
+    def jid(self):
+        return '%s.%s' % (self.ClusterId, self.ProcId)
+
+    @property
+    def gid(self):
+        # "group" id: 29441552.0 -> 29441552.-1. Note journal actually uses 
+        # 029441552.-1 but we loose '0' when autocasting ClusterId to integer
+        return "%s.-1" % self.ClusterId
+
+    @property 
+    def group(self):
+        if self.get('AccountingGroup'):
+            if 'ifthenelse' in self.get('AccountingGroup').lower():
+                if self.req_gpu:
+                    return 'gpu?'
+            else:
+                # vbrik.gpu
+                return self.AccountingGroup.split('.')[0]
+
+    @property
+    def host(self):
+        if 'RemoteHost' in self:
+            if '@' in self.RemoteHost:
+                # typical: slot1@host.icecube.wisc.edu
+                # glidein: slot1@82807@bladeg2.zeuthen.desy.de
+                return self.RemoteHost.split('.')[0].split('@')[-1]
+            else:
+                return self.RemoteHost # machine has no slots, e.g. a grid vm
+
+    @property
+    def req_cpu(self):
+        return self.RequestCpus
+
+    @property
+    def req_disk(self):
+        if 'RequestDisk' in self:
+            try:
+                return self.RequestDisk//10**6
+            except TypeError:
+                return '?'
+    
+    @property
+    def req_gpu(self):
+        if 'Requestgpus' in self:
+            try:
+                return self.Requestgpus
+            except TypeError:
+                return '?'
+        else:
+            return 0
+
+    @property
+    def req_mem(self):
+        if 'RequestMemory' in self:
+            try:
+                return self.RequestMemory//1000 
+            except TypeError:
+                return '?'
+
+    @property
+    def used_cpu(self):
+        attrs = ('RemoteUserCpu', 'RemoteSysCpu', 'CommittedTime', 'CommittedSuspensionTime')
+        if set(attrs).issubset(self.keys()):
+            tot_cpu = self.RemoteUserCpu + self.RemoteSysCpu
+            tot_time = self.CommittedTime - self.CommittedSuspensionTime
+            return tot_cpu/max(tot_time, 1)
+
+    @property
+    def used_disk(self):
+        if 'DiskUsage' in self:
+            return self.DiskUsage//10**6
+    
+    @property
+    def used_mem(self):
+        if 'ResidentSetSize_RAW' in self:
+            return self.ResidentSetSize_RAW//1000000
+
+
+    def fillmissing(self, other):
+        for attr in [k for k in other if k not in self.keys()]:
+            self[attr] = self._autocast(other[attr])
+
+class CondorQueue(object):
+    def __init__(self):
+        # attrs that *might* be in "groups"
+        self.attrs = ['ClusterId', 'ProcId', 'JobStatus', 'LastJobStatus',
+                        'LastRemoteHost', 'RemoteHost', 'ExitCode', 'HoldReason',
+                        'NumShadowStarts', 'NumJobStarts', 'JobCurrentStartDate',
+                        'Owner', 'AccountingGroup', 'QDate',
+                        'RequestMemory', 'RequestCpus', 'RequestDisk', 'Requestgpus',
+                        'RemoteUserCpu', 'RemoteSysCpu', 'CommittedTime', 'CommittedSuspensionTime',
+                        'ResidentSetSize_RAW', 'DiskUsage']
+        self._schedd = Schedd()
+        t0 = time()
+        self.jobs = dict((j.jid, j) for j in self._query())
+        stderr("! init %s jobs in %ss" % (len(self.jobs), round(time() - t0, 2)))
+
+    def _query(self, ftr='True'):
+        t0 = time()
+        raw_jobs = self._schedd.query(ftr, self.attrs)
+        stderr("! query", ftr, "results", len(raw_jobs), "time", round(time() - t0, 2))
+        return [CondorJob(j, self.attrs) for j in raw_jobs]
+
+    def _query_job(self, jid):
+        cid,pid = jid.split('.')
+        jobs = self._query('ClusterId==%s && ProcId==%s' % (cid, pid))
+        return (jobs[0] if jobs else None)
+
+    def __getitem__(self, jid):
+        if jid not in self.jobs:
+            self.create(jid)
+        job = self.jobs[jid]
+        if job.gid not in self.jobs:
+            self.create(job.gid)
+        group = self.jobs[job.gid]
+        job.fillmissing(group)
+        return job
+
+    def create(self, jid):
+        if jid in self.jobs:
+            stderr("job %s already exists" % jid)
+        else:
+            cid,pid = jid.split('.')
+            self.jobs[jid] = CondorJob({'ClusterId':cid, 'ProcId':pid})
+
+    def delete(self, jid):
+        jid = (jid if jid[0] != '0' else jid[1:])
+        self.jobs.pop(jid, None)
+
+    def update(self, jid, attr, val):
+        if attr not in self.attrs:
+            return
+        if jid not in self.jobs:
+            self.create(jid)
+        self.jobs[jid][attr] = val
+
+class recursivedefaultdict(defaultdict):
+    def __init__(self):
+        self.default_factory = type(self)
+
+    def __str__(self):
+        return str(dict(self))
+
+    def __repr__(self):
+        return str(dict(self))
+
+stderr = lambda *args: print(*args, file=sys.stderr)
+Filters = {}
+
+# dot defaults 
+def dotdef(value, default=0):
+    if value == default: 
+        return '.'
+    elif value is None:
+        return '?'
+    else: 
+        return value
+
+def elapsed(t, now=None):
+    now = (time() if now is None else now)
+    dt = int(now - t)
+    hours = dt//60//60
+    mins = (dt - hours * 60 * 60) // 60
+    secs = dt % 60
+    return "%s:%02d:%02d" % (hours, mins, secs)
+
+def fields(src, keys):
+    return '  '.join('%s=%s' % (k, src[k]) for k in keys)
+
+def get_quaple(line):
+    first = second = third = fourth = ''
+    line = line.strip()
+    try:
+        first, second, third, fourth = line.split(' ', 3)
+    except ValueError:
+        try:
+            first, second, third = line.split(' ', 2)
+        except ValueError:
+            try:
+                first, second = line.split(' ', 1)
+            except ValueError:
+                first = line
+    return [s.strip().replace('"', '') for s in 
+                                [first, second, third, fourth]]
+
+def log_job_event(color, title, job, msg=""):
+    blank = "-:--:--"
+    qtime = (elapsed(job.QDate) if job.QDate else blank)
+    rtime = (elapsed(job.JobCurrentStartDate) if job.JobCurrentStartDate else blank)
+    rtime = (rtime if rtime != "0:00:00" else blank)
+    def encode(value, default):
+        if value == default: return '.'
+        elif value is None: return '?'
+        else: return value
+    reqs = 'r=%s,%s,%s,%s' % (
+                            job.req_mem if job.req_mem is not None else '?',
+                            job.req_cpu if job.req_cpu is not None else '?', 
+                            job.req_disk if job.req_disk is not None else '?',
+                            job.req_gpu if job.req_gpu is not None else '?',)
+    group = (job.group or '.')
+    def filter_match(filter, value):
+        if not filter:
+            return True
+        if value in filter:
+            return True
+        else:
+            if '!' + str(value) in filter:
+                return False
+            else:
+                return True
+    if (filter_match(Filters['groups'], group)
+            and filter_match(Filters['users'], job.Owner)
+            and filter_match(Filters['jobs'], job.jid)
+            and filter_match(Filters['machines'], job.host)):
+        print(ansi['wht'] + strftime('%T'), color,
+                "%-13s %-14s  %-13s %-10s %-10s %8s/%-8s  %-8s " % 
+                    (title, job.jid, job.Owner, group, job.host, rtime, qtime, reqs),
+                msg, end=ansi['rst'] + "\n")
+    sys.stdout.flush()
+
+def process_journal_attr_update(job, attr, val, jstate):
+    jid = job.jid
+    if attr == jstate.incomplete.get(jid):
+        del jstate.incomplete[jid]
+        log_job_status_transition(job)
+    # log job events
+    if attr == 'JobStatus':
+        # Inside DAG blocks, when a job starts running, sometimes, JobStatus
+        # is updated before RemoteHost so we may need to delay logging
+        if jstate.in_tx and val == '2' and job['RemoteHost'] is None:
+            jstate.incomplete[jid] = 'RemoteHost'
+        else:
+            log_job_status_transition(job)
+    # log abnormal job attributes
+    if attr == 'NumJobStarts' and val not in ('0', '1'): 
+        log_job_event(ansi['und'], 'NumJobStarts', job, 
+                    fields(job, ['NumJobStarts', 'LastRemoteHost']))
+    return jstate
+
+
+def log_job_status_transition(job):
+    old = JobStatus[job.get('LastJobStatus', None)]
+    new = JobStatus[job['JobStatus']]
+    if (old, new) == ('U', 'I') or (old, new) == ('N', 'I'):
+        log_job_event(ansi['*blk'], "Submitted", job)
+    elif (old, new) == ('I', 'R'):
+        log_job_event(ansi['*grn'], "Started", job)
+    elif (old, new) == ('R', 'C'):
+        stats = []
+        if job['ExitCode'] != 0:
+            stats.append('ExitCode')
+        if job['NumJobStarts'] > 1:
+            stats.append('NumJobStarts')
+        usage = "u=%s,%s,%s  " % (
+                    (job.used_mem if job.used_mem is not None else '?'),
+                    (int(round(job.used_cpu)) if job.used_cpu != None else '?'),
+                    (job.used_disk if job.used_disk is not None else '?'))
+        log_job_event(ansi['blu'], "Completed", job, usage + fields(job, stats))
+    elif (old, new) == ('R', 'I'):
+        log_job_event(ansi['*ylw'], "Interrupted", job)
+    elif new == 'H':
+        log_job_event(ansi['*cyn'], "Held", job, fields(job, ['HoldReason']))
+    elif (old, new) == ('H', 'I'):
+        log_job_event(ansi['!cyn'] + ansi['inv'], "Released", job, 
+                                                fields(job, ['HoldReason']))
+    elif new == 'X':
+        log_job_event(ansi['blk'], "Removed", job)
+    elif new == 'S':
+        log_job_event(ansi['red'], "Suspended", job)
+    else:
+        log_job_event(ansi['inv'], "UNEXPECTED EVENT", job)
+        pprint(job)
+
+# issues:
+#   - need to prune jobs in case miss a line, also parent jobs
+#   - entire journal file is replayed when condor rotates it 
+#       (might be an issue with how condor does rotation)
+#   - doesn't show req for submitted events because JobStatus may
+#       be updated before reqs
+#
+# todo:
+#   goal: watch for problems
+#       restrict to abnormal events by excluding normal events: submissions, 
+#          completions with no errors, ...
+#       watch for very short jobs
+#   goal: watch a resource
+#       follow: user, host, slot (e.g. gpu slots), group, machine, job, cluster
+#   goal: identify "big" jobs
+def main():
+    parser = argparse.ArgumentParser(
+            description="Display a real-time log of Condor job events obtained "
+                        "from tailing condor_schedd's transaction log.",
+            epilog = "This script generates no load on condor_schedd except "
+                        "one call during initialization. On rare occasions, log "
+                        "entries may contain stale or missing attributes.",
+            formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+    parser.add_argument('--journal', default="/var/lib/condor/spool/job_queue.log",
+        help='path to schedd journal file')
+    g = parser.add_argument_group("filtering arguments", 
+            'Restrict output to events matching given criteria. '
+            'None default means no constraint. Use trailing ! to negate.')
+    g.add_argument('-g', dest='groups', metavar='GROUP', nargs='+',
+        help='group restriction')
+    g.add_argument('-m', dest='machines', metavar='HOST', nargs='+',
+        help='machine restriction')
+    g.add_argument('-u', dest='users', metavar='USER', nargs='+',
+        help='user restriction')
+    g.add_argument('-j', dest='jobs', metavar='ID', nargs='+',
+        help='job restriction')
+    args = parser.parse_args()
+    pprint(args)
+
+    global Filters
+    Filters['groups'] = args.groups
+    Filters['machines'] = args.machines
+    Filters['users'] = args.users
+    Filters['jobs'] = args.jobs
+
+    queue = CondorQueue()
+    jstate = JournalState()
+    for marker, jid, attr, val, line in journal_rob(args.journal):
+        # leading zero of group/cluster ids is lost when CondorJob converts it to int
+        jid = (jid if jid and jid[0] != '0' else jid[1:])
+        # new classad
+        if marker == '101': 
+            jstate.in_tx = False
+            queue.create(jid)
+        # destroy classad
+        elif marker == '102': 
+            queue.delete(jid)
+        # set attr
+        elif marker == '103': 
+            if attr in queue.attrs and attr not in ('ProcId', 'ClusterId'):
+                queue.update(jid, attr, val)
+                # if regular (non-group) job
+                if '-' not in jid:
+                    jstate = process_journal_attr_update(queue[jid], attr, val, jstate)
+        # delete attr
+        elif marker == '104': 
+            pass
+        # begin transaction
+        elif marker == '105': 
+            jstate.in_tx = True
+        # end transaction
+        elif marker == '106': 
+            jstate.in_tx = False
+        # journal rotated
+        elif marker == '107': 
+            stderr("New journal", line)
+        else:
+            print('Unexpected marker', marker, line)
+            continue
+
+
+if __name__ == '__main__':
+    main()
+
+# vim:nowrap

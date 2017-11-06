@@ -1,0 +1,391 @@
+#!/usr/bin/python
+#!/bin/env/python doesn't work if eval `.../setup.sh` had been run.
+from __future__ import division
+from __future__ import print_function
+import argparse
+import os
+import sys
+from collections import namedtuple
+from itertools import groupby, chain
+from pprint import pprint
+from subprocess import Popen, CalledProcessError, PIPE
+from operator import itemgetter
+from time import time
+from i3admin.ptab import Cell, CellBlock, ptab_disable_color
+import htcondor
+from htcondor import AdTypes, DaemonTypes
+import classad
+
+def _compact(scale, min_, max_=None, ndigits=0):
+    def func(val):
+        if val is None:
+            return ' '
+        val = val/scale
+        if ndigits > 0:
+            val = round(val, ndigits)
+        else:
+            val = int(round(val))
+        if min_ <= val <= (max_ if max_ is not None else min_):
+            return '.'
+        else:
+            if ndigits > 0:
+                ret = str(val).replace('0.', '.')
+                if ret == '.0':
+                    return '0'
+                else:
+                    return ret
+            else:
+                return str(val)
+    return func
+
+UserRow = CellBlock(cells=[
+            ('usr', Cell('USER', 16, 'r', 
+                            descr='user name')),
+            ('run', Cell('RUNNING', 7, 'r', '*grn', _compact(1, 0),
+                            descr='number of running jobs')),
+            ('idl', Cell('IDLE', 5, 'r', '*blk', _compact(1, 0),
+                            descr='number of idle jobs')),
+            ('hld', Cell('HELD', 5, 'r', 'blk', _compact(1, 0),
+                            descr='number of held jobs')),
+            ('spacer0', Cell('', 1)),
+            ('prio_idx', Cell('RPRIO', 5, 'c', '*wht',
+                            descr='number of users with better priority')),
+            ('spacer1', Cell('', 1)),
+            ('stv', Cell('AGE', 8, 'r', 'wht',
+                            descr='time since submission')),
+            ('irestarts', Cell('TRY', 3, 'c', 'blk', _compact(1, 0, 0),
+                            descr='number of job starts')),
+            ('irmem', Cell('RMEM', 4, 'r', 'cyn', _compact(1000, 1),
+                            descr='memory requested')),
+            ('ircpu', Cell('RCPU', 4, 'r', 'pur', _compact(1, 1),
+                            descr='CPU requested')),
+            ('irdsk', Cell('RDSK', 4, 'r', 'blu', _compact(10**6, 1),
+                            descr='disk requested')),
+            ('irgpu', Cell('RGPU', 4, 'r', 'blk', lambda x: ' ' if x is None else str(x),
+                            descr='GPUs requested')),
+            ('spacer2', Cell('', 2)),
+            ('runt', Cell('RUNTIME', 8, 'r', 'wht',
+                            descr='time since last (re)start')),
+            ('rdelay', Cell('DELAY', 8, 'r', '*blk',
+                            descr='time between submission and last (re)start')),
+            ('spacer3', Cell('', 1)),
+            ('rrestarts', Cell('TRY', 3, 'c', 'blk', _compact(1, 0, 1),
+                            descr='number of restarts')),
+            ('spacer4', Cell('', 1)),
+            ('rrmem', Cell('RMEM', 4, 'r', 'cyn', _compact(1000, 1),
+                            descr='memory requested')),
+            ('umem', Cell('RSS', 3, 'r', '*cyn', _compact(10**6, 1),
+                            descr='peak resident set size')),
+            ('uswp', Cell('SW?', 3, 'r', 'cyn', _compact(10**6, 0),
+                            descr='approximate peak swap usage (unreliable)')),
+            ('spacer5', Cell('', 1)),
+            ('rrcpu', Cell('RCPU', 4, 'r', 'pur', _compact(1, 1),
+                            descr='CPU requested')),
+            ('uucpu', Cell('USR', 3, 'r', '*pur', _compact(1, 1, 2),
+                            descr='average user CPU utilization')),
+            ('uscpu', Cell('SYS', 3, 'r', '*ylw', _compact(1, 0, 0),
+                            descr='average system CPU utilization')),
+            ('spacer6', Cell('', 1)),
+            ('rrdsk', Cell('RDSK', 4, 'r', 'blu', _compact(10**6, 1),
+                            descr='disk requested')),
+            ('udsk', Cell('DSK', 3, 'r', '*blu', _compact(10**6, 0),
+                            descr='peak disk usage (unreliable)')),
+            ('spacer7', Cell('', 1)),
+            ('rrgpu', Cell('RGPU', 4, 'r', 'blk', lambda x: ' ' if x is None else str(x),
+                            descr='GPUs requested')),
+        ],
+        rubric_spans={
+                    'idle-job-maxima':['stv', 'irgpu'],
+                    'running-job-maxima':['runt', 'rrgpu'],
+                    'job-counts':['run', 'hld'],
+                },
+        descr='Job info',
+    )
+
+def _adapt_sub_999_inf(v):
+    if v == 999:
+        return 'inf'
+    else:
+        return str(v)
+
+GroupRow = CellBlock(sep=':', 
+    cells=[
+        ('name', Cell('GROUP', style='*wht', descr='name')),
+        ('quota', Cell('QUOTA', style='wht', adapter=_adapt_sub_999_inf, descr='running job quota')),
+        ('used', Cell('USED',    style='wht', descr='number of jobs running')),
+        ('waiting', Cell('WAITING', style='wht', descr='number of jobs idle '))],
+    descr='Group info',
+)
+
+def elapsed(t):
+    dt = int(time() - t)
+    days = dt//60//60//24
+    hours = (dt - days * 24 * 60 *60) // 60 // 60
+    mins = (dt - days * 24 * 60 * 60 - hours * 60 * 60) // 60
+    if days:
+        return "%s+%02d:%02d" % (days, hours, mins)
+    else:
+        return "%d:%02d" % (hours, mins)
+
+class CondorPriorities(object):
+    def __init__(self, empty=False):
+        #keys:  'AccountingGroup', 'AccumulatedUsage', 'BeginUsageTime', 
+        #       'IsAccountingGroup', 'LastUsageTime', 'Name', 'Priority', 
+        #       'PriorityFactor', 'Requested', 'ResourcesUsed', 
+        #       'WeightedAccumulatedUsage', 'WeightedResourcesUsed'
+        if empty:
+            self._prios = []
+        else:
+            try:
+                self._prios = [dict(p) for p in htcondor.Negotiator().getPriorities()]
+            except RuntimeError:
+                print("WARNING: failed to obtain priority information", file=sys.stderr)
+                self._prios = []
+
+    def get(self, user, group):
+        domain = "@icecube.wisc.edu"
+        if group == '<none>':
+            name = user + domain
+        elif group == 'dagman':
+            return 0
+        else:
+            name = group + '.' + user + domain
+        match = [p for p in self._prios if p['Name'] == name]
+        if len(match) == 1:
+            return float(match[0]['Priority'])
+        else:
+            return -1
+
+    def index(self, user, group):
+        domain = "@icecube.wisc.edu"
+        if group == '<none>':
+            name = user + domain
+        elif group == 'dagman':
+            return 0
+        else:
+            name = group + '.' + user + domain
+        match = [p for p in self._prios if p['Name'] == name]
+        if len(match) == 1:
+            prio = match[0]['Priority']
+            return len([p for p in self._prios 
+                        if p['AccountingGroup'] == group
+                            and not p['IsAccountingGroup']
+                            and p['ResourcesUsed']
+                            and p['Priority'] < prio])
+        else:
+            return -1
+
+class CondorSchedd(object):
+    def __init__(self, names=[]):
+        if names:
+            ads = htcondor.Collector().locateAll(DaemonTypes.Schedd)
+            self.schedds = [htcondor.Schedd(a) for a in ads if a['Name'] in names]
+        else:
+            self.schedds = [htcondor.Schedd()]
+
+    def query(self, ftr, attrs=('ClusterId', 'ProcId')):
+        return chain.from_iterable(s.xquery(ftr, attrs) for s in self.schedds)
+
+def check_output(*args, **kwargs):
+    proc = Popen(stdout=PIPE, *args, **kwargs)
+    stdout, stderr = proc.communicate()
+    if proc.poll():
+        raise CalledProcessError(proc.returncode, kwargs.get('args') or args)
+    return stdout
+
+def sgroupby(iterable, keyfunc):
+    for k,g in groupby(sorted(iterable, key=keyfunc), keyfunc):
+        yield k, list(g)
+
+def get_jobs(ftr, attrs=('ClusterId', 'ProcId')):
+    jobs = []
+    for j in Schedd.query(ftr, attrs):
+        j = dict(j)
+        try:
+            j['jid'] = '%s.%s' % (j['ClusterId'], j['ProcId'])
+        except KeyError:
+            j['jid'] = None
+        try:
+            # AccountingGroup could be an expr
+            j['group'] = str(j['AccountingGroup']).split('.')[0]
+        except KeyError:
+            j['group'] = '<none>'
+        exprs = [a for a in j if isinstance(j[a], classad.ExprTree)]
+        for a in exprs:
+            j[a] = j[a].eval()
+        jobs.append(j)
+    return jobs
+
+def get_groups(negotiator):
+    try:
+        if negotiator:
+            return check_output(['condor_config_val', '-negotiator', 'GROUP_NAMES',
+                                    '-address', '<%s>' % negotiator]).split()
+        else:
+            return check_output(['condor_config_val', '-negotiator', 'GROUP_NAMES']).split()
+    except CalledProcessError:
+        print("WARNING: failed to obtain group information", file=sys.stderr)
+        return []
+
+def get_quota(group, negotiator=None):
+    if group == '<none>':
+        return float('inf')
+    if group == '<unk>':
+        return float('nan')
+    elif group == 'dagman':
+        return int(htcondor.param['MAX_DAGS_RUNNING'])
+    else:
+        if negotiator:
+            return int(check_output(
+                ['condor_config_val', '-negotiator', 'GROUP_QUOTA_' + group,
+                    '-address', '<%s>' % negotiator]))
+        else:
+            return int(check_output(
+                ['condor_config_val', '-negotiator', 'GROUP_QUOTA_' + group]))
+    
+def split_jobs_by_status(jobs):
+    return ([j for j in jobs if j['JobStatus'] == 1],
+            [j for j in jobs if j['JobStatus'] == 2],
+            [j for j in jobs if j['JobStatus'] == 5])
+
+def get_peak_swap(jobs):
+    img = [j.get('ImageSize_RAW') for j in jobs]
+    rss = [j.get('ResidentSetSize_RAW') for j in jobs]
+    swp = [(i - r) for i,r in zip(img, rss) if i and r]
+    try:
+        return max(swp)
+    except ValueError:
+        return None
+
+def get_peak_load(jobs, attr):
+    now = time()
+    loads = [j[attr]/(now - j['EnteredCurrentStatus']) for j in jobs
+                if now - j['EnteredCurrentStatus'] > 600]
+    try:
+        return max(filter(None, loads))
+    except ValueError:
+        return None
+
+def get_peak(jobs, attr):
+    vals = [j.get(attr) for j in jobs]
+    try:
+        return max(filter(None, vals))
+    except ValueError:
+        return None
+
+def summarize_group(name, constraint, negotiator):
+    attrs = ['Owner', 'AccountingGroup', 'JobStatus', 
+                'RequestMemory', 'RequestDisk', 'RequestCpus', 'Requestgpus',
+                'QDate', 'EnteredCurrentStatus', 'NumJobStarts',
+                'ResidentSetSize_RAW', 'ImageSize_RAW', 'DiskUsage_RAW',
+                'RemoteUserCpu', 'RemoteSysCpu',
+                ]
+    group_jobs = get_jobs(constraint, attrs)
+    if not group_jobs:
+        return
+    idle,running,held = split_jobs_by_status(group_jobs)
+    if group_jobs:
+        GroupRow.set('name', name)
+        GroupRow.set('quota', get_quota(name, negotiator))
+        GroupRow.set('used', len(running))
+        GroupRow.set('waiting', len(idle))
+        print(GroupRow.render())
+        for user, user_jobs in sgroupby(group_jobs, itemgetter('Owner')):
+            idle,running,held = split_jobs_by_status(user_jobs)
+            UserRow.set('usr', user)
+            UserRow.set('run', len(running))
+            UserRow.set('idl', len(idle))
+            UserRow.set('hld', len(held))
+            UserRow.set('prio_idx', Prios.index(user, name) if idle else '.')
+            rdates = [j['EnteredCurrentStatus'] for j in running]
+            UserRow.set('runt', (elapsed(min(rdates)) if rdates else '-:--'))
+            idates = [j['QDate'] for j in idle]
+            UserRow.set('stv', (max(0, elapsed(min(idates))) if idates else '-:--'))
+            delays = [(time() + j['QDate'] - j['EnteredCurrentStatus']) for j in running]
+            UserRow.set('rdelay', (elapsed(min(delays)) if delays else '-:--'))
+            UserRow.set('ircpu', get_peak(idle, 'RequestCpus')),
+            UserRow.set('irdsk', get_peak(idle, 'RequestDisk')),
+            UserRow.set('irgpu', get_peak(idle, 'Requestgpus')),
+            UserRow.set('irmem', get_peak(idle, 'RequestMemory')),
+            UserRow.set('irestarts', get_peak(idle, 'NumJobStarts') or 0),
+            UserRow.set('rrestarts', get_peak(running, 'NumJobStarts') or 0),
+            UserRow.set('rrcpu', get_peak(running, 'RequestCpus')),
+            UserRow.set('rrgpu', get_peak(running, 'Requestgpus')),
+            UserRow.set('rrdsk', get_peak(running, 'RequestDisk')),
+            UserRow.set('rrmem', get_peak(running, 'RequestMemory')),
+            UserRow.set('umem', get_peak(running, 'ResidentSetSize_RAW'))
+            UserRow.set('udsk', get_peak(running, 'DiskUsage_RAW'))
+            UserRow.set('uucpu', get_peak_load(running, 'RemoteUserCpu'))
+            UserRow.set('uscpu', get_peak_load(running, 'RemoteSysCpu'))
+            UserRow.set('uswp', get_peak_swap(running))
+            print(UserRow.render())
+
+def summary(opts, head=True):
+    if head:
+        print(GroupRow.title())
+        print(UserRow.title())
+    for group in Groups:
+        if opts.groups is None or group in opts.groups:
+            con = 'JobUniverse == 5 && regexp("^%s\.", AccountingGroup) && (%s)' \
+                    % (group, opts.constraint)
+            summarize_group(group, con, opts.negotiator)
+    if opts.groups is None or '.' in opts.groups:
+        con = 'JobUniverse == 5 && AccountingGroup =?= UNDEFINED && (%s)' % opts.constraint
+        summarize_group('<none>', con, opts.negotiator)
+    if opts.groups is None:
+        con = 'JobUniverse == 5 && AccountingGroup =!= UNDEFINED && (%s)' % opts.constraint
+        if Groups:
+            con += ' && ' + '&&'.join(
+                        ['regexp("^%s\.", AccountingGroup) =!= True' % g for g in Groups])
+        summarize_group('<unk>', con, opts.negotiator)
+
+def dag_summary(opts):
+    print(GroupRow.title())
+    print(UserRow.title())
+    con = 'JobUniverse == 7 && (%s)' % opts.constraint
+    summarize_group('dagman', con, opts.negotiator)
+
+def main():
+    epilog = "Note that the presented data is approximate and not real-time. " \
+                "Dots indicate default or \"expected\" values. Blank spaces " \
+                "indicate \"no information\"."
+    parser = argparse.ArgumentParser(
+            description="A dashboard-style overview of jobs in a Condor pool.",
+            epilog=epilog + " Report problems to help@icecube.wisc.edu.",
+            formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+    parser.add_argument('schedds', nargs='*', metavar='SCHEDD_FQDN',
+            help='names of schedds to query; all if None')
+    parser.add_argument('--help-legend', action='store_true',
+            help='print column descriptions and exit')
+    parser.add_argument('--color', default=False, action='store_true',
+            help='colorize output')
+    parser.add_argument('--show-dags', default=False, action='store_true',
+            help='also show DAGMan job summary')
+    parser.add_argument('-g', dest='groups', nargs='+', metavar='GROUP',
+            help='constrain by group; use "." to select jobs with no accounting group')
+    parser.add_argument('-c', dest='constraint', metavar='CONSTRAINT', default='TRUE',
+            help='raw condor constraint')
+    parser.add_argument('-n', dest='negotiator', metavar='NEGOTIATOR',
+            help='retrieve groups from this negotiator directly')
+    parser.add_argument('--no-prios', default=False, action='store_true',
+            help='do not retrive priorities')
+    opts = parser.parse_args()
+
+    if not opts.color:
+        ptab_disable_color()
+    if opts.help_legend:
+        GroupRow.legend()
+        print()
+        UserRow.legend()
+        print("\n" + epilog)
+        return
+    global Prios, Schedd, Groups
+    Groups = get_groups(opts.negotiator)
+    Prios = CondorPriorities(empty=opts.no_prios)
+    Schedd = CondorSchedd(opts.schedds)
+    if opts.show_dags:
+        dag_summary(opts)
+    summary(opts, head=not opts.show_dags)
+    
+if __name__ == '__main__':
+    main()

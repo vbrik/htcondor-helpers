@@ -1,0 +1,181 @@
+#!/usr/bin/python
+# using "#!/usr/bin/env python" results in "ImportError: No module named htcondor"
+# if eval `/cvmfs/icecube.opensciencegrid.org/standard/setup.sh` had been run.
+from __future__ import division
+from __future__ import print_function
+import argparse
+import htcondor
+from htcondor import AdTypes
+from operator import itemgetter
+from time import time
+from i3admin.ptab import Cell, CellBlock, ptab_disable_color
+
+SlotRow = CellBlock(cells=[
+            ('user', Cell('USER', 12, 'r', 
+                            descr='slot user')),
+            ('agrp', Cell('AGROUP', 6, 'r', 'def', 
+                            lambda g: '.' if g == '<none>' else g[:6],
+                            descr='slot accounting group')),
+            ('spacer0', Cell('', 1)),
+            ('host', Cell('HOST', 11, 'r', 'def', 
+                            descr='slot worker host')),
+            ('slot', Cell('SLOT', 4, 'l', 'def', 
+                            descr='slot name')),
+            ('spacer1', Cell('', 1)),
+            ('stat', Cell('ST', 2, 'c', 'def',
+                            descr='slot state')),
+            ('spacer2', Cell('', 1)),
+            ('job', Cell('JOB', 14, 'r', 'def',
+                            descr='slot job id')),
+            ('spacer3', Cell('', 1)),
+            ('cpu', Cell('CPU', 7, 'r', 'def', 
+                            descr='slot cpu usage')),
+            ('mem', Cell('MEM', 7, 'r', 'def', 
+                            descr='slot memory usage')),
+            ('dsk', Cell('DSK', 7, 'r', 'def', 
+                            descr='slot disk allocation')),
+            ('spacer4', Cell('', 1)),
+            ('gpu', Cell('GPU', 3, 'c', 'def',
+                            lambda n: (n if n != '0' else '.'),
+                            descr='slot gpus')),
+            ('spacer5', Cell('', 1)),
+            ('age', Cell('AGE', 10, 'r', 'def', 
+                            descr='slot age')),
+        ],
+        descr='Slot summary',
+    )
+
+def elapsed(t):
+    now = time()
+    dt = int(now - t)
+    hours = dt//60//60
+    mins = (dt - hours * 60 * 60) // 60
+    secs = dt % 60
+    return "%s:%02d:%02d" % (hours, mins, secs)
+
+def main():
+    parser = argparse.ArgumentParser(
+            description="Display information about execute slots in a Condor pool.",
+            epilog="Significance Thresholds: 1GB for memory; "
+                ".3-.5 for load average. "
+                "Report problems to help@icecube.wisc.edu.",
+            formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+    parser.add_argument('patterns', nargs='*', metavar='PATTERN',
+            help="quick match on owner, group, host, slot, or job. "
+                 "Notes: multiple patterns are ORed with each other and ANDed with "
+                 "filter switches listed below; "
+                 "pattern N@ will match slot N and no subslots; "
+                 "machine name patterns are regular expressions, so NAME-1\\\\. will "
+                 "match only machine NAME-1.domain and not NAME-10.domain.")
+    parser.add_argument('--help-legend', action='store_true', 
+            help='print column descriptions and exit')
+    g = parser.add_argument_group("filter switches", 
+            "Restrict output to slots matching given criteria. Multiple switches "
+            "are ANDed together.")
+    g.add_argument('-i', dest='idle', action='store_true', 
+            help="idle slots")
+    g.add_argument('-I', dest='idle_nontrivial', action='store_true', 
+            help="idle slots with non-trivial resources, as defined below")
+    g.add_argument('-b', dest='busy', action='store_true', 
+            help="busy slots")
+    g.add_argument('-d', dest='draining', action='store_true', 
+            help="draining slots")
+    g.add_argument('-g', dest='gpus', action='store_true', 
+            help="gpu slots")
+    g.add_argument('-o', dest='owner', action='store_true', 
+            help="overloaded slots")
+    g.add_argument('-M', dest='overmem', action='store_true', 
+            help="memory overusers")
+    g.add_argument('-C', dest='overcpu', action='store_true', 
+            help="CPU overusers")
+    g.add_argument('--age', metavar='HOURS', dest='age', type=int,
+            help="minimum age")
+    g.add_argument('--user', metavar='USER', dest='user', 
+            help="owner name")
+    g.add_argument('--group', metavar='GROUP', dest='group',
+            help="accounting group")
+    args = parser.parse_args()
+
+    if args.help_legend:
+        SlotRow.legend()
+        return
+    constraint = []
+    if args.patterns:
+        disjuncts = []
+        for pat in args.patterns:
+            disjuncts.extend([
+                    'regexp("^%s", Machine)' % pat,
+                    'RemoteUser=="%s@icecube.wisc.edu"' % pat,
+                    'RemoteUser=="nice-user.%s@icecube.wisc.edu"' % pat,
+                    'regexp("^%s\.", AccountingGroup)' % pat,
+                    # JobId match on cluster + process
+                    'JobId=="%s"' % pat,
+                    # JobId match on cluster only
+                    'regexp("^%s\.", string(JobId))' % pat,
+                    # exact slot + subslot match
+                    'regexp("slot%s@", string(name))' % pat,
+                    # dynamic slot match (pat assumed to end with @)
+                    'regexp("slot%s", string(name))' % pat,
+                ])
+        constraint += ['(%s)' % ' || '.join(disjuncts)]
+    if args.idle:
+        constraint += ['Activity=="Idle"']
+    if args.busy:
+        constraint += ['Activity=="Busy"']
+    if args.draining:
+        constraint += ['State=="Drained"']
+    if args.gpus:
+        constraint += ['Gpus > 0']
+    if args.owner:
+        constraint += ['State=="Owner"']
+    if args.user:
+        constraint += ['RemoteUser=="%s@icecube.wisc.edu"' % args.user]
+    if args.group:
+        constraint += ['regexp("^%s\.", AccountingGroup)' % args.group]
+    if args.idle_nontrivial:
+        constraint += ['Activity=="Idle" && LoadAvg < 0.5 '
+                        '&& Memory >= 1000 && Cpus >= 1 '
+                        '&& EnteredCurrentState < %s' % int(time() - 60)]
+    if args.age:
+        constraint += ['EnteredCurrentState < %s' % int(time() - args.age * 60 * 60)]
+    if args.overmem:
+        constraint += ['ImageSize/1000 > Memory + 1000']
+    if args.overcpu:
+        constraint += ['LoadAvg > Cpus + 0.5']
+
+    attrs = ['RemoteUser', 'AccountingGroup', 'JobId', 'Machine', 'name',
+            'EnteredCurrentState', 'ImageSize', 'Memory', 'LoadAvg', 'Cpus', 
+            'GPUs', 'Disk', 'Activity', 'State',]
+    collector = htcondor.Collector()
+    slots = collector.query(AdTypes.Startd, ' && '.join(constraint), attrs)
+    slots = [dict(s) for s in slots]
+    [s.setdefault('AccountingGroup', '<none>') for s in slots]
+    [s.setdefault('RemoteUser', '<none>') for s in slots]
+    [s.setdefault('JobId', '<none>') for s in slots]
+    [s.setdefault('ImageSize', 0) for s in slots]
+    [s.setdefault('GPUs', 0) for s in slots]
+
+    slots.sort(key=itemgetter('RemoteUser', 'AccountingGroup', 'Machine', 'name'))
+
+    print(SlotRow.title())
+    for s in slots:
+        if s['RemoteUser'].startswith('nice-user.'):
+            SlotRow['user'] = s['RemoteUser'].split('@')[0].split('.', 1)[-1]
+        else:
+            SlotRow['user'] = s['RemoteUser'].split('@')[0]
+        SlotRow['agrp'] = s['AccountingGroup'].split('.')[0]
+        SlotRow['host'] = s['Machine'].split('.')[0]
+        SlotRow['slot'] = s['name'].split('@')[0][4:]
+        SlotRow['stat'] = '%s%s' % (s['State'][0], s['Activity'][0])
+        SlotRow['job'] = s['JobId']
+        SlotRow['cpu'] = '%s/%s' % (round(s['LoadAvg'], 1), s['Cpus'])
+        SlotRow['mem'] = '%s/%s' % (int(round(s['ImageSize']/1000000)),
+                                int(round(s['Memory']/1000)))
+        SlotRow['dsk'] = int(round(s['Disk']/1000000))
+        SlotRow['gpu'] = '%s' % s['GPUs']
+        SlotRow['age'] = elapsed(s['EnteredCurrentState'])
+        print(SlotRow.render())
+    print(SlotRow.title())
+
+if __name__ == '__main__':
+    main()
